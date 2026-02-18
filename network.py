@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
-Mininet Virtual Network with OS Fingerprint Spoofing
-Builds a virtual network of hosts with different OS fingerprints, scannable by Nmap.
+Universal Mininet Virtual Network with OS Fingerprint Spoofing
+and Automatic Bridging to Host Network over OVS.
 
-Requirements:
-  sudo apt install mininet nmap python3-pip
-  sudo pip3 install mininet
+Features:
+ - Auto-detects VM network interface, IP, prefix, gateway
+ - Graceful fallback to user input when detection fails
+ - Safely moves L3 from NIC to OVS bridge (no route deletion)
+ - Creates internal OVS gateway (10.0.0.254/24)
+ - Automatically assigns default routes to Mininet hosts
+ - Enables necessary forwarding sysctls
+ - Saves + restores iptables state
+ - Fully restores all VM network state on exit
 
 Usage:
-  sudo python3 network.py [--topo star|linear|tree] [--verbose]
+   sudo python3 network.py [--topo star|linear|tree] [--verbose]
 """
 
 import argparse
@@ -23,18 +29,16 @@ import tempfile
 import shutil
 
 from mininet.net import Mininet
-from mininet.node import OVSSwitch, Controller
-from mininet.link import Link
+from mininet.node import OVSSwitch
 from mininet.log import setLogLevel, info, error
 from mininet.cli import CLI
 from mininet.topo import Topo
 
-# ── OS Fingerprint profiles ────────────────────────────────────────────────────
-# Each profile defines:
-# ttl        : IP TTL value (Linux≈64, Windows≈128, Cisco≈255, BSD≈64)
-# tcp_window : TCP window size
-# os_label   : human-readable label
-# services   : list of (port, protocol, banner) tuples to open
+
+# ==============================================================================
+# OS FINGERPRINT PROFILES
+# ==============================================================================
+
 OS_PROFILES = {
     "windows_server_2019": {
         "ttl": 128,
@@ -42,10 +46,10 @@ OS_PROFILES = {
         "os_label": "Windows Server 2019",
         "services": [
             (80, "http", "HTTP/1.1 200 OK\r\nServer: Microsoft-IIS/10.0\r\nContent-Length: 0\r\n\r\n"),
-            (135, "raw", ""),  # RPC endpoint mapper
-            (139, "raw", ""),  # NetBIOS
-            (445, "raw", ""),  # SMB
-            (3389, "raw", ""), # RDP
+            (135, "raw", ""),
+            (139, "raw", ""),
+            (445, "raw", ""),
+            (3389, "raw", ""),
         ],
     },
     "ubuntu_22": {
@@ -54,8 +58,8 @@ OS_PROFILES = {
         "os_label": "Ubuntu 22.04 LTS",
         "services": [
             (22, "ssh", "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1\r\n"),
-            (80, "http", "HTTP/1.1 200 OK\r\nServer: Apache/2.4.52 (Ubuntu)\r\nContent-Length: 0\r\n\r\n"),
-            (3306, "raw", ""),  # MySQL
+            (80, "http", "HTTP/1.1 200 OK\r\nServer: Apache/2.4.52\r\nContent-Length: 0\r\n\r\n"),
+            (3306, "raw", ""),
         ],
     },
     "centos_7": {
@@ -64,8 +68,8 @@ OS_PROFILES = {
         "os_label": "CentOS 7",
         "services": [
             (22, "ssh", "SSH-2.0-OpenSSH_7.4\r\n"),
-            (80, "http", "HTTP/1.1 200 OK\r\nServer: Apache/2.4.6 (CentOS)\r\nContent-Length: 0\r\n\r\n"),
-            (443, "http", "HTTP/1.1 200 OK\r\nServer: Apache/2.4.6 (CentOS)\r\nContent-Length: 0\r\n\r\n"),
+            (80, "http", "HTTP/1.1 200 OK\r\nServer: Apache/2.4.6\r\nContent-Length: 0\r\n\r\n"),
+            (443, "http", "HTTP/1.1 200 OK\r\nServer: Apache/2.4.6\r\nContent-Length: 0\r\n\r\n"),
         ],
     },
     "cisco_ios": {
@@ -73,7 +77,7 @@ OS_PROFILES = {
         "tcp_window": 4128,
         "os_label": "Cisco IOS 15.x",
         "services": [
-            (23, "raw", "\xff\xfb\x01\xff\xfb\x03\xff\xfd\x18\xff\xfd\x1f"), # Telnet IAC
+            (23, "raw", "\xff\xfb\x01\xff\xfb\x03\xff\xfd\x18\xff\xfd\x1f"),
             (80, "http", "HTTP/1.1 200 OK\r\nServer: cisco-IOS\r\nContent-Length: 0\r\n\r\n"),
         ],
     },
@@ -82,8 +86,8 @@ OS_PROFILES = {
         "tcp_window": 65535,
         "os_label": "FreeBSD 13",
         "services": [
-            (22, "ssh", "SSH-2.0-OpenSSH_9.0 FreeBSD-20221006\r\n"),
-            (80, "http", "HTTP/1.1 200 OK\r\nServer: Apache/2.4.54 (FreeBSD)\r\nContent-Length: 0\r\n\r\n"),
+            (22, "ssh", "SSH-2.0-OpenSSH_9.0 FreeBSD\r\n"),
+            (80, "http", "HTTP/1.1 200 OK\r\nServer: Apache/2.4.54\r\nContent-Length: 0\r\n\r\n"),
         ],
     },
     "android_device": {
@@ -91,8 +95,8 @@ OS_PROFILES = {
         "tcp_window": 65700,
         "os_label": "Android 12",
         "services": [
-            (5555, "raw", "CNXN\x00\x00\x00\x01"),  # ADB banner
-            (8080, "http", "HTTP/1.1 200 OK\r\nServer: BaseHTTP/0.6 Python/3.10\r\nContent-Length: 0\r\n\r\n"),
+            (5555, "raw", "CNXN\x00\x00\x00\x01"),
+            (8080, "http", "HTTP/1.1 200 OK\r\nServer: BaseHTTP/0.6 Python\r\nContent-Length: 0\r\n\r\n"),
         ],
     },
     "macos_ventura": {
@@ -101,8 +105,8 @@ OS_PROFILES = {
         "os_label": "macOS Ventura 13",
         "services": [
             (22, "ssh", "SSH-2.0-OpenSSH_9.0\r\n"),
-            (548, "raw", ""),  # AFP
-            (5900, "raw", "RFB 003.889\n"),  # VNC
+            (548, "raw", ""),
+            (5900, "raw", "RFB 003.889\n"),
         ],
     },
     "windows_10": {
@@ -117,17 +121,19 @@ OS_PROFILES = {
     },
 }
 
-# ── Topology definitions ───────────────────────────────────────────────────────
+
+# ==============================================================================
+# TOPOLOGIES
+# ==============================================================================
+
 class StarTopo(Topo):
-    """All hosts connected to a single switch."""
     def build(self, n_hosts=8):
-        switch = self.addSwitch("s1")
+        s = self.addSwitch("s1")
         for i in range(1, n_hosts + 1):
-            host = self.addHost(f"h{i}", ip=f"10.0.0.{i}/24")
-            self.addLink(host, switch)
+            h = self.addHost(f"h{i}", ip=f"10.0.0.{i}/24")
+            self.addLink(h, s)
 
 class LinearTopo(Topo):
-    """Hosts connected in a chain: h1-s1-s2-h2 ..."""
     def build(self, n_hosts=8):
         switches = []
         for i in range(1, n_hosts + 1):
@@ -139,392 +145,333 @@ class LinearTopo(Topo):
             self.addLink(switches[i], switches[i + 1])
 
 class TreeTopo(Topo):
-    """Two-tier tree: core switch → edge switches → hosts."""
     def build(self, n_hosts=8):
         core = self.addSwitch("s0")
-        edge1 = self.addSwitch("s1")
-        edge2 = self.addSwitch("s2")
-        self.addLink(core, edge1)
-        self.addLink(core, edge2)
+        s1 = self.addSwitch("s1")
+        s2 = self.addSwitch("s2")
+        self.addLink(core, s1)
+        self.addLink(core, s2)
         half = n_hosts // 2
         for i in range(1, half + 1):
             h = self.addHost(f"h{i}", ip=f"10.0.0.{i}/24")
-            self.addLink(h, edge1)
+            self.addLink(h, s1)
         for i in range(half + 1, n_hosts + 1):
             h = self.addHost(f"h{i}", ip=f"10.0.0.{i}/24")
-            self.addLink(h, edge2)
+            self.addLink(h, s2)
 
-# ── Service emulation ──────────────────────────────────────────────────────────
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+
+def run(cmd):
+    return subprocess.run(shlex.split(cmd), capture_output=True, text=True).stdout.strip()
+
+def safe_run(cmd):
+    subprocess.run(shlex.split(cmd), capture_output=True, text=True)
+
+def detect_primary_iface():
+    """Try several methods; fallback to user input."""
+    # First try route-get
+    out = run("ip route get 1.1.1.1")
+    m = re.search(r"dev (\S+)", out)
+    if m:
+        return m.group(1)
+
+    # Fallback to first non-virtual NIC
+    out = run("ip -o link show")
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) < 2:
+            continue
+        iface = parts[1].strip()
+        if iface.startswith(("lo", "virbr", "docker", "veth", "br-", "ovs")):
+            continue
+        return iface
+
+    # Last fallback: ask user
+    print("\nCould not auto-detect primary interface.")
+    iface = input("Enter your primary NIC name (e.g., enp0s3): ").strip()
+    return iface
+
+def detect_ip_and_prefix(iface):
+    out = run(f"ip -4 addr show dev {iface}")
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/(\d+)", out)
+    if m:
+        return m.group(1), int(m.group(2))
+    print(f"\nFailed to detect IP for {iface}.")
+    ip = input("Enter IPv4 address (e.g., 192.168.0.130): ").strip()
+    pre = int(input("Enter prefix length (e.g., 24): "))
+    return ip, pre
+
+def detect_gateway_for_iface(iface):
+    out = run("ip route show default")
+    for line in out.splitlines():
+        if f" dev {iface} " in line:
+            parts = line.split()
+            if "via" in parts:
+                return parts[parts.index("via") + 1]
+    print("\nCould not auto-detect default gateway.")
+    return input("Enter default gateway (e.g., 192.168.0.1): ").strip()
+
+def save_iptables():
+    tmp = tempfile.mkstemp(prefix="iptables_", suffix=".save")[1]
+    rules = run("iptables-save")
+    with open(tmp, "w") as f:
+        f.write(rules)
+    return tmp
+
+def restore_iptables(path):
+    if os.path.exists(path):
+        safe_run(f"iptables-restore {path}")
+
+
+# ==============================================================================
+# SERVICE LISTENER CREATOR
+# ==============================================================================
+
 LISTENER_SCRIPT = """\
 #!/usr/bin/env python3
-import socket, threading, sys, os, signal
+import socket, threading, sys, signal
+
 banner = {banner!r}
 port = {port}
 
-def handle(conn):
+def handle(c):
     try:
         if banner:
-            conn.sendall(banner if isinstance(banner, bytes) else banner.encode())
-        conn.recv(1024)
-    except Exception:
+            c.sendall(banner.encode() if isinstance(banner, str) else banner)
+        c.recv(1024)
+    except:
         pass
     finally:
-        conn.close()
+        c.close()
 
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(('0.0.0.0', port))
-server.listen(50)
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", port))
+s.listen(20)
 
-def stopper(sig, frame):
-    server.close()
+def stop(sig, frame):
+    s.close()
     sys.exit(0)
 
-signal.signal(signal.SIGTERM, stopper)
-signal.signal(signal.SIGINT, stopper)
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
 
 while True:
     try:
-        conn, _ = server.accept()
-        threading.Thread(target=handle, args=(conn,), daemon=True).start()
-    except OSError:
+        c, _ = s.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+    except:
         break
 """
 
-def apply_os_fingerprint(host, profile):
-    """
-    Apply kernel-level tweaks to make a Mininet host respond with a given
-    OS fingerprint (TTL, TCP window size, TCP options).
-    """
-    ttl = profile["ttl"]
-    window = profile["tcp_window"]
-    label = profile["os_label"]
-
-    info(f" [*] {host.name}: applying fingerprint → {label}\n")
-
-    # Set default TTL
-    host.cmd(f"sysctl -w net.ipv4.ip_default_ttl={ttl}")
-    # TCP window / rmem
-    host.cmd(f"sysctl -w net.ipv4.tcp_rmem='4096 {window} {window * 4}'")
-    host.cmd(f"sysctl -w net.core.rmem_default={window}")
-    host.cmd(f"sysctl -w net.core.rmem_max={window * 4}")
-    # Disable timestamps for some profiles (Windows-style)
-    if ttl == 128:
-        host.cmd("sysctl -w net.ipv4.tcp_timestamps=0")
-        host.cmd("sysctl -w net.ipv4.tcp_sack=1")
-    else:
-        host.cmd("sysctl -w net.ipv4.tcp_timestamps=1")
-    # Enable ICMP responses
-    host.cmd("sysctl -w net.ipv4.icmp_echo_ignore_all=0")
-
 def start_services(host, profile, tmp_dir):
-    """Spawn a tiny TCP listener for every service in the profile."""
     pids = []
-    for svc in profile["services"]:
-        port, proto, banner = svc
-        script_path = os.path.join(tmp_dir, f"{host.name}_port{port}.py")
-        script = LISTENER_SCRIPT.format(banner=banner, port=port)
-        with open(script_path, "w") as f:
+    for port, proto, banner in profile["services"]:
+        script = LISTENER_SCRIPT.format(port=port, banner=banner)
+        path = os.path.join(tmp_dir, f"{host.name}_{port}.py")
+        with open(path, "w") as f:
             f.write(script)
-        pid = host.cmd(f"python3 {script_path} &>/tmp/{host.name}_{port}.log & echo $!")
-        pid = pid.strip()
+        pid = host.cmd(f"python3 {path} &>/tmp/{host.name}_{port}.log & echo $!").strip()
         if pid.isdigit():
             pids.append(int(pid))
         info(f" → {host.name}:{port}/{proto} (pid {pid})\n")
     return pids
 
-# ── Networking helpers (robust detection; no route deletion) ───────────────────
-def run(cmd):
-    """Run command, return stdout (str)."""
-    return subprocess.run(shlex.split(cmd), capture_output=True, text=True).stdout.strip()
 
-def wait_for_default_route(timeout=8, interval=0.5):
-    """Wait until a default route appears (up to timeout seconds). Return True/False."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if run("ip route show default"):
-            return True
-        time.sleep(interval)
-    return False
+# ==============================================================================
+# MAIN NETWORK BUILD
+# ==============================================================================
 
-def detect_iface_via_route_get(target_ip="1.1.1.1"):
-    """
-    Try 'ip route get <target>' and parse 'dev XXX', 'src Y.Y.Y.Y', and 'via Z.Z.Z.Z' (optional).
-    Returns (iface, src_ip, via_gateway_or_None) or (None, None, None) on failure.
-    """
-    out = run(f"ip route get {target_ip}")
-    if not out:
-        return None, None, None
-    parts = out.split()
-    iface = parts[parts.index("dev")+1] if "dev" in parts else None
-    src_ip = parts[parts.index("src")+1] if "src" in parts else None
-    via = parts[parts.index("via")+1] if "via" in parts else None
-    return iface, src_ip, via
-
-def detect_iface_with_ipv4():
-    """
-    Return the first non-virtual iface that has a global IPv4 and carrier (avoid lo, docker*, veth*, virbr*, ovs*).
-    """
-    lines = run("ip -o -4 addr show scope global").splitlines()
-    for line in lines:
-        # Example: "2: enp0s3    inet 192.168.0.27/24 brd 192.168.0.255 scope global dynamic enp0s3"
-        cols = line.split()
-        iface = cols[1]
-        if iface.startswith(("lo", "docker", "veth", "virbr", "ovs")):
-            continue
-        link = run(f"cat /sys/class/net/{iface}/operstate") or "unknown"
-        if link.strip() in ("up", "unknown"):  # 'unknown' for some virt drivers
-            m = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)\/(\d+)\b", line)
-            if m:
-                return iface, m.group(1), int(m.group(2))
-    return None, None, None
-
-def get_iface_ipv4_and_prefix(iface):
-    out = run(f"ip -o -4 addr show dev {iface}")
-    m = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)\/(\d+)\b", out)
-    if not m:
-        return None, None
-    return m.group(1), int(m.group(2))
-
-def get_default_gateway_for_iface(iface):
-    """
-    Try to find a default route line that mentions this iface. Return gw or None.
-    """
-    for line in run("ip route show default").splitlines():
-        if f" dev {iface} " in f" {line} ":
-            parts = line.split()
-            if "via" in parts:
-                return parts[parts.index("via")+1]
-    return None
-
-def save_iptables_state():
-    """Save current iptables rules to a temp file; return path."""
-    rules = subprocess.run(["iptables-save"], capture_output=True, text=True).stdout
-    path = tempfile.mkstemp(prefix="mininet_iptables_", suffix=".save")[1]
-    with open(path, "w") as f:
-        f.write(rules)
-    return path
-
-def restore_iptables_state(path):
-    """Restore iptables rules from a file, if present."""
-    if path and os.path.exists(path):
-        subprocess.run(["iptables-restore", path], capture_output=True, text=True)
-
-# ── Main ───────────────────────────────────────────────────────────────────────
 def build_network(topo_name="star", verbose=False):
     if os.geteuid() != 0:
-        error("ERROR: This script must be run as root (sudo).\n")
+        error("This script must be run with sudo.\n")
         sys.exit(1)
 
     setLogLevel("info" if verbose else "warning")
 
     profiles = list(OS_PROFILES.items())
     n_hosts = len(profiles)
-    info(f"\n[+] Building '{topo_name}' topology with {n_hosts} hosts\n")
 
-    # Select topology
-    if topo_name == "star":
-        topo = StarTopo(n_hosts=n_hosts)
-    elif topo_name == "linear":
-        topo = LinearTopo(n_hosts=n_hosts)
-    else:
-        topo = TreeTopo(n_hosts=n_hosts)
+    info(f"\n[+] Building topology '{topo_name}' with {n_hosts} hosts\n")
 
-    # OVSSwitch in standalone mode (no controller) → normal L2 behaviour
-    net = Mininet(
-        topo=topo,
-        switch=OVSSwitch,
-        controller=None,  # No OpenFlow controller
-        autoSetMacs=True,
-    )
+    topo = {"star": StarTopo, "linear": LinearTopo, "tree": TreeTopo}[topo_name](n_hosts=n_hosts)
+    net = Mininet(topo=topo, switch=OVSSwitch, controller=None, autoSetMacs=True)
+    net.start()
 
-    # Keep resources we may need to restore in cleanup
     tmp_dir = tempfile.mkdtemp(prefix="mininet_services_")
-    iptables_save_path = None
+    ipt_backup = save_iptables()
+
+    # ----------------------------------------------------------------------
+    # DETECT PRIMARY NIC, IP, PREFIX, GATEWAY
+    # ----------------------------------------------------------------------
+    VM_IFACE = detect_primary_iface()
+    orig_ip, orig_pre = detect_ip_and_prefix(VM_IFACE)
+    orig_gw = detect_gateway_for_iface(VM_IFACE)
+
+    info(f"[+] Primary NIC: {VM_IFACE}  ({orig_ip}/{orig_pre})  gw={orig_gw}\n")
+
+    # ----------------------------------------------------------------------
+    # PREPARE SWITCH
+    # ----------------------------------------------------------------------
+    primary_switch = net.switches[0].name
+    info(f"[+] Using primary switch: {primary_switch}\n")
+
+    # Make switch a pure L2 device
+    safe_run(f"ovs-vsctl del-controller {primary_switch}")
+    safe_run(f"ovs-vsctl set-fail-mode {primary_switch} standalone")
+    safe_run(f"ovs-ofctl del-flows {primary_switch}")
+    safe_run(f"ovs-ofctl add-flow {primary_switch} priority=0,actions=NORMAL")
+
+    # ----------------------------------------------------------------------
+    # MOVE L3 FROM NIC → SWITCH
+    # ----------------------------------------------------------------------
+    info(f"[+] Bridging {VM_IFACE} into {primary_switch}\n")
+    safe_run(f"ovs-vsctl add-port {primary_switch} {VM_IFACE}")
+
+    # Remove IP from NIC
+    safe_run(f"ip addr flush dev {VM_IFACE}")
+
+    # Assign original LAN IP to the switch itself
+    safe_run(f"ip addr add {orig_ip}/{orig_pre} dev {primary_switch}")
+    safe_run(f"ip link set {primary_switch} up")
+
+    # Replace default route atomically
+    safe_run(f"ip route replace default via {orig_gw} dev {primary_switch}")
+
+    # ----------------------------------------------------------------------
+    # CREATE INTERNAL MININET GATEWAY
+    # ----------------------------------------------------------------------
+    gw_port = f"{primary_switch}-gw"
+    info(f"[+] Creating internal gateway {gw_port} = 10.0.0.254/24\n")
+    safe_run(f"ovs-vsctl add-port {primary_switch} {gw_port} -- set Interface {gw_port} type=internal")
+    safe_run(f"ip link set {gw_port} up")
+    safe_run(f"ip addr add 10.0.0.254/24 dev {gw_port}")
+
+    # Kernel forwarding knobs
+    safe_run("sysctl -w net.ipv4.ip_forward=1")
+    safe_run("sysctl -w net.ipv4.conf.all.rp_filter=0")
+    safe_run(f"sysctl -w net.ipv4.conf.{VM_IFACE}.rp_filter=0")
+    safe_run(f"sysctl -w net.ipv4.conf.{primary_switch}.rp_filter=0")
+    safe_run("sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true")
+    safe_run("sysctl -w net.bridge.bridge-nf-call-arptables=0 2>/dev/null || true")
+
+    # Open FORWARD chain
+    safe_run("iptables -P FORWARD ACCEPT")
+    safe_run("iptables -F FORWARD")
+
+    # ----------------------------------------------------------------------
+    # CONFIGURE HOSTS
+    # ----------------------------------------------------------------------
     host_map = {}
-    VM_IFACE = None
-    orig_ip = None
-    orig_prefix = None
-    orig_gw = None
-    primary_switch = None
 
-    try:
-        net.start()
+    for i, (pname, profile) in enumerate(profiles, start=1):
+        h = net.get(f"h{i}")
+        ip = h.IP()
+        info(f"\n[+] Host {h.name} ({ip}) → {profile['os_label']}\n")
 
-        # Configure every switch to use normal L2 forwarding
-        for switch in net.switches:
-            info(f"[+] Setting {switch.name} to standalone mode with NORMAL forwarding\n")
-            subprocess.run(["ovs-vsctl", "del-controller", switch.name], check=False)
-            subprocess.run(["ovs-vsctl", "set-fail-mode", switch.name, "standalone"], check=False)
-            subprocess.run(["ovs-ofctl", "del-flows", switch.name], check=False)
-            subprocess.run(["ovs-ofctl", "add-flow", switch.name, "priority=0,actions=NORMAL"], check=False)
+        # Apply OS fingerprint tweaks
+        h.cmd(f"sysctl -w net.ipv4.ip_default_ttl={profile['ttl']}")
+        h.cmd(f"sysctl -w net.ipv4.tcp_rmem='4096 {profile['tcp_window']} {profile['tcp_window'] * 4}'")
+        h.cmd(f"sysctl -w net.core.rmem_default={profile['tcp_window']}")
+        h.cmd(f"sysctl -w net.core.rmem_max={profile['tcp_window'] * 4}")
+        h.cmd(f"sysctl -w net.ipv4.icmp_echo_ignore_all=0")
 
-        # ── Robust detection of primary interface/IP/gateway (bridged mode) ──
-        wait_for_default_route(timeout=8, interval=0.5)  # don't block too long
+        # Assign default route to gateway
+        h.cmd("ip route add default via 10.0.0.254")
 
-        VM_IFACE, detected_ip, gw_via = detect_iface_via_route_get("1.1.1.1")
-        if VM_IFACE and detected_ip:
-            orig_ip = detected_ip
-            ip_pref = get_iface_ipv4_and_prefix(VM_IFACE)
-            if ip_pref and ip_pref[1] is not None:
-                orig_prefix = ip_pref[1]
-            orig_gw = gw_via or get_default_gateway_for_iface(VM_IFACE)
+        # Start services
+        pids = start_services(h, profile, tmp_dir)
+
+        host_map[h.name] = {
+            "ip": ip,
+            "profile": pname,
+            "label": profile["os_label"],
+            "ports": [s[0] for s in profile["services"]],
+            "pids": pids,
+        }
+
+    # ----------------------------------------------------------------------
+    # CONNECTIVITY CHECK
+    # ----------------------------------------------------------------------
+    info("\n[+] Checking Mininet internal routing\n")
+    for hname in host_map:
+        h = net.get(hname)
+        out = h.cmd("ping -c1 -W1 10.0.0.254")
+        if "1 received" in out:
+            info(f" ✓ {hname} → 10.0.0.254 OK\n")
         else:
-            VM_IFACE, orig_ip, orig_prefix = detect_iface_with_ipv4()
-            if not VM_IFACE:
-                raise RuntimeError("Could not detect a primary interface with IPv4. Is the bridged NIC up and configured?")
-            orig_gw = get_default_gateway_for_iface(VM_IFACE)
+            info(f" ✗ {hname} → 10.0.0.254 FAILED\n")
 
-        info(f"\n[+] Primary interface: {VM_IFACE}\n")
-        info(f"[+] Address on {VM_IFACE}: {orig_ip}/{orig_prefix}\n")
-        if orig_gw:
-            info(f"[+] Default gateway (detected): {orig_gw}\n")
-        else:
-            info("[!] No default gateway detected yet. Route changes will be skipped.\n")
+    # ----------------------------------------------------------------------
+    # PRINT HELP FOR WINDOWS
+    # ----------------------------------------------------------------------
+    print("\n============================================================")
+    print(" Mininet Hosts:")
+    print("============================================================")
+    for hname, d in host_map.items():
+        print(f"{hname:<6} {d['ip']:<15} {d['label']:<25} ports={d['ports']}")
+    print("============================================================")
 
-        # Determine which OVS switch to use for bridging (first switch)
-        primary_switch = net.switches[0].name
-        info(f"[+] Using primary switch for bridging: {primary_switch}\n")
+    print(f"""
+From your Windows machine, enable ICMP echo and run:
 
-        # For visibility
-        result = subprocess.run(["ip", "-4", "addr", "show", "dev", VM_IFACE], capture_output=True, text=True)
-        info(f" Current {VM_IFACE} config:\n{result.stdout.strip()}\n")
+    route -p add 10.0.0.0 mask 255.255.255.0 {orig_ip}
 
-        # ── Bridge the physical interface into OVS ──
-        info(f"\n[+] Bridging {VM_IFACE} into OVS switch {primary_switch}\n")
-        subprocess.run(["ovs-vsctl", "add-port", primary_switch, VM_IFACE], check=False)
+Then scan:
 
-        # Move L3 from NIC → OVS device (assign IP first, bring device up)
-        subprocess.run(["ip", "addr", "flush", "dev", VM_IFACE], check=False)
-        subprocess.run(["ip", "addr", "add", f"{orig_ip}/{orig_prefix}", "dev", primary_switch], check=False)
-        subprocess.run(["ip", "link", "set", primary_switch, "up"], check=False)
-
-        # SAFER: atomically replace default route only if we know a gateway
-        if orig_gw:
-            subprocess.run(["ip", "route", "replace", "default", "via", orig_gw, "dev", primary_switch], check=False)
-        else:
-            info("[!] Skipping default route setup (no gateway detected).\n")
-
-        # Enable IP forwarding and relax FORWARD policy (save/restore iptables)
-        iptables_save_path = save_iptables_state()
-        subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=False)
-        subprocess.run(["iptables", "-P", "FORWARD", "ACCEPT"], check=False)
-        subprocess.run(["iptables", "-F", "FORWARD"], check=False)
-
-        info(f"[+] Bridge setup complete. VM reachable at {orig_ip} via {primary_switch}\n")
-
-        # ── Assign profiles and start services ──
-        info("\n[+] Configuring host fingerprints and services\n")
-        for i, (profile_name, profile) in enumerate(profiles):
-            host = net.get(f"h{i + 1}")
-            ip = host.IP()
-            info(f"\n Host h{i+1} ({ip}) → {profile['os_label']}\n")
-            apply_os_fingerprint(host, profile)
-            pids = start_services(host, profile, tmp_dir)
-            host_map[host.name] = {
-                "ip": ip,
-                "profile": profile_name,
-                "label": profile["os_label"],
-                "ports": [s[0] for s in profile["services"]],
-                "pids": pids,
-            }
-            time.sleep(0.2)  # let listeners bind
-
-        # ── Verify internal connectivity ──
-        info("\n[+] Verifying internal connectivity...\n")
-        for i, (profile_name, profile) in enumerate(profiles):
-            host = net.get(f"h{i + 1}")
-            target_idx = (i + 1) % n_hosts + 1
-            result = host.cmd(f"ping -c 1 -W 1 10.0.0.{target_idx}")
-            if "1 received" in result:
-                info(f" ✓ {host.name} → 10.0.0.{target_idx} OK\n")
-            else:
-                info(f" ✗ {host.name} → 10.0.0.{target_idx} FAILED\n")
-
-        # Print summary table
-        print("\n" + "=" * 65)
-        print(f"{'Host':<6} {'IP':<14} {'OS Fingerprint':<25} {'Ports'}")
-        print("=" * 65)
-        for name, info_d in host_map.items():
-            ports = ", ".join(str(p) for p in info_d["ports"])
-            print(f"{name:<6} {info_d['ip']:<14} {info_d['label']:<25} {ports}")
-        print("=" * 65)
-
-        # Print Nmap commands
-        subnet = "10.0.0.0/24"
-        print(f"""
-Scan from your Windows host:
-  # Quick ping sweep:
-  nmap -sn {subnet}
-  # OS fingerprint + service version scan:
-  nmap -O -sV -T4 {subnet}
-  # Aggressive scan (all ports):
-  nmap -A -T4 {subnet}
-
-Scan from inside Mininet CLI:
-  mininet> h1 nmap -O -sV {subnet}
-
-Open Mininet CLI → type 'exit' or Ctrl-D to stop the network.
+    nmap -sn 10.0.0.0/24
+    nmap -O -sV -T4 10.0.0.0/24
 """)
 
-        CLI(net)
+    print("Entering Mininet CLI. Type exit or Ctrl-D to quit.\n")
+    CLI(net)
 
-    finally:
-        # ── Cleanup ──
-        info("\n[+] Stopping network...\n")
+    # ----------------------------------------------------------------------
+    # CLEANUP
+    # ----------------------------------------------------------------------
+    info("\n[+] Cleaning up...\n")
+    for hname, d in host_map.items():
+        h = net.get(hname)
+        for pid in d["pids"]:
+            h.cmd(f"kill {pid} 2>/dev/null")
 
-        # Stop service listeners
-        for name, info_d in host_map.items():
-            host = net.get(name)
-            for pid in info_d["pids"]:
-                host.cmd(f"kill {pid} 2>/dev/null")
+    # Remove gateway port
+    safe_run(f"ovs-vsctl del-port {primary_switch} {gw_port}")
 
-        # Move L3 back: OVS → NIC (and restore default route atomically)
-        if primary_switch and VM_IFACE and orig_ip and orig_prefix:
-            subprocess.run(["ovs-vsctl", "del-port", primary_switch, VM_IFACE], check=False)
-            subprocess.run(["ip", "addr", "flush", "dev", VM_IFACE], check=False)
-            subprocess.run(["ip", "addr", "add", f"{orig_ip}/{orig_prefix}", "dev", VM_IFACE], check=False)
-            subprocess.run(["ip", "link", "set", VM_IFACE, "up"], check=False)
-            if orig_gw:
-                subprocess.run(["ip", "route", "replace", "default", "via", orig_gw, "dev", VM_IFACE], check=False)
-            else:
-                info("[!] No recorded original gateway; leaving default route unchanged.\n")
+    # Remove physical NIC from switch
+    safe_run(f"ovs-vsctl del-port {primary_switch} {VM_IFACE}")
 
-        # Restore iptables rules
-        if iptables_save_path:
-            restore_iptables_state(iptables_save_path)
-            try:
-                os.remove(iptables_save_path)
-            except Exception:
-                pass
+    # Restore NIC addressing
+    safe_run(f"ip addr flush dev {VM_IFACE}")
+    safe_run(f"ip addr add {orig_ip}/{orig_pre} dev {VM_IFACE}")
+    safe_run(f"ip link set {VM_IFACE} up")
+    safe_run(f"ip route replace default via {orig_gw} dev {VM_IFACE}")
 
-        # Remove temp dir with service scripts
-        try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
+    # Restore iptables
+    restore_iptables(ipt_backup)
+    try:
+        os.remove(ipt_backup)
+    except:
+        pass
 
-        # Stop Mininet and clean OVS namespaces
-        try:
-            net.stop()
-        except Exception:
-            pass
-        subprocess.run(["mn", "--clean"], capture_output=True)
+    net.stop()
+    safe_run("mn --clean")
 
-        print("[+] Network stopped and cleaned up.")
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    print("[+] Cleanup complete. Goodbye.")
+
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Mininet virtual network with OS fingerprint spoofing"
-    )
-    parser.add_argument(
-        "--topo",
-        choices=["star", "linear", "tree"],
-        default="star",
-        help="Network topology (default: star)",
-    )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Enable verbose Mininet logging"
-    )
+    parser = argparse.ArgumentParser(description="Universal Mininet virtual network with OS fingerprint spoofing")
+    parser.add_argument("--topo", choices=["star", "linear", "tree"], default="star")
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
     build_network(topo_name=args.topo, verbose=args.verbose)
