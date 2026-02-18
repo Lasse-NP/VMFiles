@@ -8,7 +8,7 @@ Requirements:
     sudo pip3 install mininet
 
 Usage:
-    sudo python3 network.py [--topo star|linear|tree] [--verbose]
+    sudo python3 Network.py [--topo star|linear|tree] [--verbose]
 """
 
 import argparse
@@ -18,8 +18,8 @@ import time
 import subprocess
 import threading
 from mininet.net import Mininet
-from mininet.node import Controller, OVSSwitch
-from mininet.link import TCLink
+from mininet.node import OVSSwitch, Controller
+from mininet.link import Link
 from mininet.log import setLogLevel, info, error
 from mininet.cli import CLI
 from mininet.topo import Topo
@@ -123,7 +123,7 @@ class StarTopo(Topo):
         switch = self.addSwitch("s1")
         for i in range(1, n_hosts + 1):
             host = self.addHost(f"h{i}", ip=f"10.0.0.{i}/24")
-            self.addLink(host, switch, cls=TCLink, bw=100, delay="1ms")
+            self.addLink(host, switch)
 
 
 class LinearTopo(Topo):
@@ -134,9 +134,9 @@ class LinearTopo(Topo):
             s = self.addSwitch(f"s{i}")
             switches.append(s)
             h = self.addHost(f"h{i}", ip=f"10.0.0.{i}/24")
-            self.addLink(h, s, cls=TCLink, bw=100, delay="1ms")
+            self.addLink(h, s)
         for i in range(len(switches) - 1):
-            self.addLink(switches[i], switches[i + 1], cls=TCLink, bw=1000, delay="2ms")
+            self.addLink(switches[i], switches[i + 1])
 
 
 class TreeTopo(Topo):
@@ -145,15 +145,15 @@ class TreeTopo(Topo):
         core = self.addSwitch("s0")
         edge1 = self.addSwitch("s1")
         edge2 = self.addSwitch("s2")
-        self.addLink(core, edge1, cls=TCLink, bw=1000, delay="1ms")
-        self.addLink(core, edge2, cls=TCLink, bw=1000, delay="1ms")
+        self.addLink(core, edge1)
+        self.addLink(core, edge2)
         half = n_hosts // 2
         for i in range(1, half + 1):
             h = self.addHost(f"h{i}", ip=f"10.0.0.{i}/24")
-            self.addLink(h, edge1, cls=TCLink, bw=100, delay="2ms")
+            self.addLink(h, edge1)
         for i in range(half + 1, n_hosts + 1):
             h = self.addHost(f"h{i}", ip=f"10.0.0.{i}/24")
-            self.addLink(h, edge2, cls=TCLink, bw=100, delay="2ms")
+            self.addLink(h, edge2)
 
 
 # ── Service emulation ──────────────────────────────────────────────────────────
@@ -243,7 +243,7 @@ def start_services(host, profile, tmp_dir):
     return pids
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────────��──────────────
 
 def build_network(topo_name="star", verbose=False):
     if os.geteuid() != 0:
@@ -265,14 +265,64 @@ def build_network(topo_name="star", verbose=False):
     else:
         topo = TreeTopo(n_hosts=n_hosts)
 
+    # ── Key change: no external controller ──
+    # We use OVSSwitch in standalone mode (no controller) so the switch
+    # behaves as a normal L2 learning switch. This ensures ALL traffic
+    # (including traffic from outside the VM) is forwarded correctly.
     net = Mininet(
         topo=topo,
         switch=OVSSwitch,
-        controller=Controller,
-        link=TCLink,
+        controller=None,       # No OpenFlow controller
         autoSetMacs=True,
     )
     net.start()
+
+    # ── Configure every switch to use normal L2 forwarding ──
+    for switch in net.switches:
+        info(f"[+] Setting {switch.name} to standalone mode with NORMAL forwarding\n")
+        # Remove any controller association
+        subprocess.run(["ovs-vsctl", "del-controller", switch.name], check=False)
+        # Set fail-mode to standalone (normal L2 switch behaviour)
+        subprocess.run(["ovs-vsctl", "set-fail-mode", switch.name, "standalone"], check=False)
+        # Add catch-all flow rule for normal MAC-learning forwarding
+        subprocess.run(["ovs-ofctl", "del-flows", switch.name], check=False)
+        subprocess.run(["ovs-ofctl", "add-flow", switch.name, "priority=0,actions=NORMAL"], check=False)
+
+    # ── Bridge the physical interface into OVS ──
+    # This allows external machines (e.g. your Windows host) to reach
+    # the Mininet hosts at layer 2 through the VM's physical NIC.
+    VM_IFACE = "enp0s3"
+    info(f"\n[+] Bridging {VM_IFACE} into OVS switch s1\n")
+
+    # Save current IP config before moving the interface
+    result = subprocess.run(
+        ["ip", "-4", "addr", "show", "dev", VM_IFACE],
+        capture_output=True, text=True
+    )
+    info(f"    Current {VM_IFACE} config: {result.stdout.strip()}\n")
+
+    # Add the physical NIC as a port on s1
+    subprocess.run(["ovs-vsctl", "add-port", "s1", VM_IFACE], check=False)
+
+    # Remove IP from the physical interface (it's now just a switch port)
+    subprocess.run(["ip", "addr", "flush", "dev", VM_IFACE], check=False)
+
+    # Bring up the bridge internal interface with the VM's IP
+    subprocess.run(["ip", "addr", "add", "192.168.0.27/24", "dev", "s1"], check=False)
+    subprocess.run(["ip", "link", "set", "s1", "up"], check=False)
+
+    # Re-add default route via the bridge
+    subprocess.run(["ip", "route", "del", "default"], capture_output=True, check=False)
+    subprocess.run(["ip", "route", "add", "default", "via", "192.168.0.1", "dev", "s1"], check=False)
+
+    # Enable IP forwarding on the VM
+    subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=False)
+
+    # Allow all forwarding in iptables
+    subprocess.run(["iptables", "-P", "FORWARD", "ACCEPT"], check=False)
+    subprocess.run(["iptables", "-F", "FORWARD"], check=False)
+
+    info(f"[+] Bridge setup complete. VM reachable at 192.168.0.27 via s1\n")
 
     tmp_dir = "/tmp/mininet_services"
     os.makedirs(tmp_dir, exist_ok=True)
@@ -296,6 +346,18 @@ def build_network(topo_name="star", verbose=False):
 
     time.sleep(1)  # let listeners bind
 
+    # ── Verify internal connectivity ──
+    info("\n[+] Verifying internal connectivity...\n")
+    for i, (profile_name, profile) in enumerate(profiles):
+        host = net.get(f"h{i + 1}")
+        # Ping another host to prime the MAC learning table
+        target_idx = (i + 1) % n_hosts + 1
+        result = host.cmd(f"ping -c 1 -W 1 10.0.0.{target_idx}")
+        if "1 received" in result:
+            info(f"  ✓ {host.name} → 10.0.0.{target_idx} OK\n")
+        else:
+            info(f"  ✗ {host.name} → 10.0.0.{target_idx} FAILED\n")
+
     # Print summary table
     print("\n" + "=" * 65)
     print(f"{'Host':<6} {'IP':<14} {'OS Fingerprint':<25} {'Ports'}")
@@ -308,17 +370,17 @@ def build_network(topo_name="star", verbose=False):
     # Print Nmap commands
     subnet = "10.0.0.0/24"
     print(f"""
-Nmap scan commands (run from another terminal using 'mn' CLI or host):
+Scan from your Windows host:
   # Quick ping sweep:
-  sudo nmap -sn {subnet}
+  nmap -sn {subnet}
 
   # OS fingerprint + service version scan:
-  sudo nmap -O -sV -T4 {subnet}
+  nmap -O -sV -T4 {subnet}
 
   # Aggressive scan (all ports):
-  sudo nmap -A -T4 {subnet}
+  nmap -A -T4 {subnet}
 
-  # Scan from inside Mininet CLI:
+Scan from inside Mininet CLI:
   mininet> h1 nmap -O -sV 10.0.0.0/24
 
 Open Mininet CLI → type 'exit' or Ctrl-D to stop the network.
@@ -332,6 +394,13 @@ Open Mininet CLI → type 'exit' or Ctrl-D to stop the network.
         host = net.get(name)
         for pid in info_d["pids"]:
             host.cmd(f"kill {pid} 2>/dev/null")
+
+    # Restore enp0s3 before stopping
+    subprocess.run(["ovs-vsctl", "del-port", "s1", VM_IFACE], check=False)
+    subprocess.run(["ip", "addr", "add", "192.168.0.27/24", "dev", VM_IFACE], check=False)
+    subprocess.run(["ip", "link", "set", VM_IFACE, "up"], check=False)
+    subprocess.run(["ip", "route", "add", "default", "via", "192.168.0.1", "dev", VM_IFACE], check=False)
+
     net.stop()
     subprocess.run(["mn", "--clean"], capture_output=True)
     print("[+] Network stopped and cleaned up.")
