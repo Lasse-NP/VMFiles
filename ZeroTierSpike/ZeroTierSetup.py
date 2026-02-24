@@ -2,6 +2,16 @@
 """
 MiniNet topology with ZeroTier L2 bridge.
 
+INSTRUCTOR Linux setup needs Python, Openvswitch, Mininet.
+
+BOTH INSTRUCTOR and TRAINEE need ZeroTier installed
+
+Connect BOTH the INSTRUCTOR and the TRAINEE to the same ZeroTier network.
+
+Accept/Authorize BOTH the INSTRUCTOR and the TRAINEE connections in ZeroTier Central
+
+Enable "Allow Ethernet Bridging" on INSTRUCTOR connection in ZeroTier Central.
+
 Usage:
     sudo python3 mininet_zerotier.py [--zt-iface <iface>] [--subnet <subnet>] [--hosts <n>]
 
